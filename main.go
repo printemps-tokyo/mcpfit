@@ -1,14 +1,15 @@
-// Command mcpfit audits a Model Context Protocol server for readiness against
-// the 2026-07-28 stateless specification release candidate and prints a graded
+// Command mcpfit audits a Model Context Protocol server against the 2026-07-28
+// stateless specification, the current published revision, and prints a graded
 // migration report with a CI exit code.
 //
 // Unlike the org's mcppeek (which inspects and lists a server), mcpfit is an
-// opinionated migration auditor: it connects, performs today's initialize
-// handshake, enumerates tools/resources/prompts, then runs a fixed catalog of
-// readiness checks and grades the result. See the README for the check catalog
-// and the 2026-07-28 changes it targets:
-//   - https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/
-//   - https://stacktr.ee/blog/mcp-2026-spec-changes
+// opinionated migration auditor: it probes server/discover, falls back to the
+// legacy initialize handshake when the server does not answer it, enumerates
+// tools/resources/prompts, then runs a fixed catalog of readiness checks and
+// grades the result. See the README for the check catalog and the 2026-07-28
+// changes it targets:
+//   - https://modelcontextprotocol.io/specification/2026-07-28
+//   - https://modelcontextprotocol.io/specification/2026-07-28/changelog
 package main
 
 import (
@@ -26,7 +27,7 @@ import (
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
-const usage = `mcpfit - audit an MCP server for 2026-07-28 stateless-spec readiness
+const usage = `mcpfit - audit an MCP server against the 2026-07-28 stateless specification
 
 Usage:
   mcpfit [flags] <command> [args...]      audit a stdio server (spawned subprocess)
@@ -37,7 +38,9 @@ Flags:
   --url <endpoint>          Audit a Streamable HTTP MCP endpoint instead of stdio
   --header "K: V"           Add a request header, e.g. auth (repeatable, HTTP)
   --timeout <dur>           Per-request timeout (default 15s), e.g. 10s, 1500ms
-  --protocol-version <ver>  protocolVersion to request in initialize (default ` + mcp.DefaultProtocolVersion + `)
+  --protocol-version <ver>  protocolVersion to request in the legacy initialize
+                            fallback (default ` + mcp.DefaultProtocolVersion + `); modern servers are
+                            always asked for ` + audit.TargetSpecVersion + `
   --strict                  Treat WARN findings as failures for the exit code
   --json                    Emit the full structured report as JSON
   --list                    Also print the enumerated tools/resources/prompts

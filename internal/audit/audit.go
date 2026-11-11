@@ -6,20 +6,30 @@
 // struct to Run, which returns a graded Report. Keeping the logic pure makes
 // every check unit-testable without a live server.
 //
-// The checks are anchored to the MCP 2026-07-28 stateless specification
-// release candidate. See:
-//   - https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/
-//   - https://stacktr.ee/blog/mcp-2026-spec-changes
+// The checks are anchored to the published MCP 2026-07-28 specification, the
+// current revision. See:
+//   - https://modelcontextprotocol.io/specification/2026-07-28
+//   - https://modelcontextprotocol.io/specification/2026-07-28/changelog
 //
-// Because the 2026-07-28 specification is a release candidate that may still
-// change, speculative or forward-looking findings are graded INFO or WARN;
-// FAIL is reserved for concrete, high-confidence breakages.
+// FAIL is reserved for concrete, high-confidence breakages against that text;
+// requirements a server has yet to meet and opinionated lint are graded WARN,
+// and neutral context is INFO.
 package audit
 
 // TargetSpecVersion is the stateless specification revision mcpfit audits
-// against. Servers that already advertise this negotiate cleanly; older
-// revisions are expected today and reported as INFO, not failures.
+// against. It is the current published revision. A server implements it when
+// it answers server/discover and lists this version; servers that only speak
+// an initialize-based (legacy) revision are reported as INFO, not failures.
 const TargetSpecVersion = "2026-07-28"
+
+// Era values for Observation.Era, following the terminology of the
+// specification's versioning page: modern servers take per-request metadata
+// (2026-07-28 and later), legacy servers require the initialize handshake
+// (2025-11-25 and earlier).
+const (
+	EraModern = "modern"
+	EraLegacy = "legacy"
+)
 
 // Severity is the outcome of a single check. Ordered from best to worst so the
 // grader can pick the dominant severity.
@@ -30,7 +40,8 @@ const (
 	Pass Severity = iota
 	// Info is neutral context or an opportunity, never a failure.
 	Info
-	// Warn is a likely problem or a forward-looking risk under the RC.
+	// Warn is a requirement of 2026-07-28 the server has yet to meet, or a
+	// likely problem that is not a certain breakage.
 	Warn
 	// Fail is a concrete, high-confidence breakage under 2026-07-28.
 	Fail

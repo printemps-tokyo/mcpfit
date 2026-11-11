@@ -1,8 +1,9 @@
 // Package mcp is mcpfit's Model Context Protocol client: JSON-RPC 2.0 over
 // either stdio (a spawned subprocess) or the Streamable HTTP transport. It
-// performs today's initialize handshake, enumerates tools/resources/prompts,
-// and records the low-level signals (session header, cache hints, auth
-// challenge) that the pure internal/audit package grades.
+// probes server/discover (MCP 2026-07-28), falls back to the legacy initialize
+// handshake when the server does not answer it, enumerates
+// tools/resources/prompts, and records the low-level signals (session header,
+// cache hints, auth challenge) that the pure internal/audit package grades.
 //
 // The transports mirror the org's mcppeek reference implementation but are
 // re-implemented in Go with the standard library only.
@@ -19,6 +20,11 @@ type Request struct {
 	ID      int    `json:"id"`
 	Method  string `json:"method"`
 	Params  any    `json:"params,omitempty"`
+
+	// protocolVersion is set for requests in the modern (per-request metadata)
+	// form. It is not part of the JSON-RPC body; the Streamable HTTP transport
+	// mirrors it, and the method, into the required request headers.
+	protocolVersion string
 }
 
 // Notification is a JSON-RPC 2.0 notification (a request without an id).

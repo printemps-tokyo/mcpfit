@@ -9,16 +9,27 @@ type Observation struct {
 	// Transport is "stdio" or "http".
 	Transport string
 
-	// RequestedVersion is the protocolVersion mcpfit asked for in initialize.
+	// Era is EraModern when the server answered server/discover, EraLegacy
+	// when mcpfit had to fall back to the initialize handshake. An empty value
+	// is treated as legacy.
+	Era string
+	// SupportedVersions is the supportedVersions list from server/discover
+	// (modern servers only).
+	SupportedVersions []string
+
+	// RequestedVersion is the protocolVersion mcpfit sent: the audited
+	// revision for a modern server, or the version asked for in initialize.
 	RequestedVersion string
-	// ProtocolVersion is the version the server negotiated in its initialize
-	// result. Empty if the handshake did not yield one.
+	// ProtocolVersion is the version in use: the audited revision (or the
+	// newest listed one) for a modern server, or the version a legacy server
+	// negotiated in its initialize result. Empty if none was reported.
 	ProtocolVersion string
 
 	ServerName    string
 	ServerVersion string
 
-	// Capabilities is the server's declared capability map from initialize.
+	// Capabilities is the server's declared capability map, from server/discover
+	// or from the initialize result.
 	Capabilities map[string]any
 
 	// Tools holds every enumerated tool (all pages).
@@ -35,13 +46,16 @@ type Observation struct {
 	// TasksCapability is true when the server declares a tasks-related
 	// capability (core, experimental, or extensions map).
 	TasksCapability bool
-	// TaskMethodsBlocking lists any observed legacy blocking task methods
-	// (tasks/result, tasks/list) that the 2026-07-28 Tasks extension removes.
-	TaskMethodsBlocking []string
+	// TaskMethodsRemoved lists observed task methods that still respond although
+	// the 2026-07-28 Tasks extension removed them. Only tasks/list is probed.
+	TaskMethodsRemoved []string
 
-	// CacheHints is true when any list/read result carried the 2026-07-28
-	// cache-control fields (ttlMs / cacheScope).
-	CacheHints bool
+	// CacheableResults counts the inspected results that 2026-07-28 requires to
+	// carry caching hints (server/discover and the list methods that answered).
+	CacheableResults int
+	// CacheHintsMissing names the methods whose result lacked ttlMs or
+	// cacheScope, in the order they were observed.
+	CacheHintsMissing []string
 
 	// HTTP authorization posture.
 	// AuthCredentialsProvided is true when the caller supplied an Authorization

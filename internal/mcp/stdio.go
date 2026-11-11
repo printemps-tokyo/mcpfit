@@ -21,12 +21,20 @@ type stdioTransport struct {
 	args    []string
 	timeout time.Duration
 
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	reader *bufio.Reader
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	// lines carries every stdout line from a single reader goroutine, so a
+	// request that times out (the server/discover probe against a silent
+	// legacy server) does not lose the lines that arrive afterwards.
+	lines chan stdioLine
 
 	mu         sync.Mutex
 	stderrTail []string
+}
+
+type stdioLine struct {
+	line string
+	err  error
 }
 
 func newStdioTransport(command string, args []string, timeout time.Duration) *stdioTransport {
@@ -51,9 +59,23 @@ func (t *stdioTransport) start() error {
 		return fmt.Errorf("stdio: failed to launch %q: %w", t.command, err)
 	}
 	t.stdin = stdin
-	t.reader = bufio.NewReaderSize(stdout, 1<<20)
+	t.lines = make(chan stdioLine, 64)
+	go t.pumpStdout(bufio.NewReaderSize(stdout, 1<<20))
 	go t.drainStderr(stderr)
 	return nil
+}
+
+// pumpStdout forwards stdout lines until the stream ends, then closes the
+// channel so later reads fail immediately instead of waiting for the timeout.
+func (t *stdioTransport) pumpStdout(r *bufio.Reader) {
+	defer close(t.lines)
+	for {
+		line, err := r.ReadString('\n')
+		t.lines <- stdioLine{line: line, err: err}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (t *stdioTransport) drainStderr(r io.Reader) {
@@ -151,27 +173,21 @@ func (t *stdioTransport) write(v any) error {
 	return nil
 }
 
-// readLine reads one line, enforcing an overall deadline by reading on a
-// goroutine and racing it against a timer. This guarantees the client never
-// blocks forever on a silent server.
+// readLine returns the next stdout line, enforcing an overall deadline by
+// racing the reader goroutine's channel against a timer. This guarantees the
+// client never blocks forever on a silent server.
 func (t *stdioTransport) readLine(deadline time.Time) (string, error) {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return "", fmt.Errorf("stdio: timed out waiting for a response%s", t.stderrHint())
 	}
-	type result struct {
-		line string
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		line, err := t.reader.ReadString('\n')
-		ch <- result{line: line, err: err}
-	}()
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 	select {
-	case r := <-ch:
+	case r, ok := <-t.lines:
+		if !ok {
+			return "", fmt.Errorf("stdio: server closed the connection before responding%s", t.stderrHint())
+		}
 		if r.err != nil {
 			if errors.Is(r.err, io.EOF) && strings.TrimSpace(r.line) == "" {
 				return "", fmt.Errorf("stdio: server closed the connection before responding%s", t.stderrHint())

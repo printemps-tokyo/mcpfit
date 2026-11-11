@@ -1,11 +1,16 @@
 // Command mockserver is a tiny, offline MCP server used only by mcpfit's tests.
-// It speaks JSON-RPC 2.0 over stdio and returns crafted initialize / list
-// responses. MOCK_MODE selects the persona:
+// It speaks JSON-RPC 2.0 over stdio and returns crafted discover / initialize /
+// list responses. MOCK_MODE selects the persona:
 //
-//	modern  a clean 2026-07-28 server: valid 2020-12 schemas, no sessions,
-//	        no tasks capability, cache hints on lists.
-//	legacy  a pre-stateless server: draft-04 schema residue and a declared
-//	        tasks capability whose blocking tasks/list still responds.
+//	modern         a clean 2026-07-28 server: answers server/discover, rejects
+//	               initialize, requires per-request _meta, valid 2020-12
+//	               schemas, no tasks capability, caching hints on every
+//	               cacheable result.
+//	legacy         an initialize-based server: rejects server/discover, has
+//	               draft-04 residue in a schema that defaults to 2020-12, and
+//	               declares a tasks capability whose tasks/list still responds.
+//	legacy-silent  like legacy, but never answers server/discover, as some
+//	               legacy servers do for requests sent before initialize.
 //
 // It is not a general-purpose server; it only answers what the tests exercise.
 package main
@@ -54,9 +59,25 @@ func handle(line, mode string, out *bufio.Writer) {
 	if req.ID == nil {
 		return // notification: nothing to answer
 	}
+	if mode == "modern" {
+		handleModern(req, out)
+		return
+	}
 	switch req.Method {
+	case "server/discover":
+		if mode == "legacy-silent" {
+			return
+		}
+		replyError(out, *req.ID, -32601, "method not found")
 	case "initialize":
-		reply(out, *req.ID, initializeResult(mode))
+		reply(out, *req.ID, map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities": map[string]any{
+				"tools": map[string]any{},
+				"tasks": map[string]any{},
+			},
+			"serverInfo": map[string]any{"name": "legacy-mock", "version": "0.1.0"},
+		})
 	case "tools/list":
 		reply(out, *req.ID, toolsList(mode))
 	case "resources/list":
@@ -64,44 +85,74 @@ func handle(line, mode string, out *bufio.Writer) {
 	case "prompts/list":
 		reply(out, *req.ID, map[string]any{"prompts": []any{}})
 	case "tasks/list":
-		if mode == "legacy" {
-			reply(out, *req.ID, map[string]any{"tasks": []any{}})
-		} else {
-			replyError(out, *req.ID, -32601, "method not found")
-		}
+		reply(out, *req.ID, map[string]any{"tasks": []any{}})
 	default:
 		replyError(out, *req.ID, -32601, "method not found")
 	}
 }
 
-func initializeResult(mode string) map[string]any {
-	if mode == "legacy" {
-		return map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities": map[string]any{
-				"tools": map[string]any{},
-				"tasks": map[string]any{},
-			},
-			"serverInfo": map[string]any{"name": "legacy-mock", "version": "0.1.0"},
-		}
+// handleModern answers as a 2026-07-28 server: there is no initialize, and a
+// request without the required per-request metadata is malformed.
+func handleModern(req request, out *bufio.Writer) {
+	var params struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
 	}
-	return map[string]any{
-		"protocolVersion": "2026-07-28",
-		"capabilities": map[string]any{
-			"tools": map[string]any{},
-		},
-		"serverInfo": map[string]any{"name": "modern-mock", "version": "1.0.0"},
+	_ = json.Unmarshal(req.Params, &params)
+	var version string
+	_ = json.Unmarshal(params.Meta["io.modelcontextprotocol/protocolVersion"], &version)
+	_, hasCaps := params.Meta["io.modelcontextprotocol/clientCapabilities"]
+
+	switch {
+	case req.Method == "initialize":
+		replyError(out, *req.ID, -32601, "method not found; this server supports 2026-07-28 only")
+		return
+	case version == "" || !hasCaps:
+		replyError(out, *req.ID, -32602, "missing required _meta fields")
+		return
+	case version != "2026-07-28":
+		writeJSON(out, map[string]any{"jsonrpc": "2.0", "id": *req.ID, "error": map[string]any{
+			"code":    -32022,
+			"message": "Unsupported protocol version",
+			"data":    map[string]any{"supported": []any{"2026-07-28"}, "requested": version},
+		}})
+		return
+	}
+
+	switch req.Method {
+	case "server/discover":
+		reply(out, *req.ID, cacheable(map[string]any{
+			"supportedVersions": []any{"2026-07-28"},
+			"capabilities":      map[string]any{"tools": map[string]any{}},
+			"_meta": map[string]any{
+				"io.modelcontextprotocol/serverInfo": map[string]any{"name": "modern-mock", "version": "1.0.0"},
+			},
+		}))
+	case "tools/list":
+		reply(out, *req.ID, cacheable(toolsList("modern")))
+	case "resources/list":
+		reply(out, *req.ID, cacheable(map[string]any{"resources": []any{}}))
+	case "prompts/list":
+		reply(out, *req.ID, cacheable(map[string]any{"prompts": []any{}}))
+	default:
+		replyError(out, *req.ID, -32601, "method not found")
 	}
 }
 
+// cacheable adds the fields 2026-07-28 requires on a complete, cacheable result.
+func cacheable(result map[string]any) map[string]any {
+	result["resultType"] = "complete"
+	result["ttlMs"] = 60000
+	result["cacheScope"] = "public"
+	return result
+}
+
 func toolsList(mode string) map[string]any {
-	if mode == "legacy" {
+	if mode != "modern" {
 		return map[string]any{
 			"tools": []any{
 				map[string]any{
 					"name": "legacy_tool",
 					"inputSchema": map[string]any{
-						"$schema":     "http://json-schema.org/draft-04/schema#",
 						"id":          "urn:legacy:tool",
 						"type":        "object",
 						"definitions": map[string]any{"pos": map[string]any{"type": "number"}},
@@ -118,7 +169,7 @@ func toolsList(mode string) map[string]any {
 			},
 		}
 	}
-	// modern: clean schema plus cache hints on the list result.
+	// modern: clean schemas; the caller adds the caching hints.
 	return map[string]any{
 		"tools": []any{
 			map[string]any{
@@ -139,8 +190,6 @@ func toolsList(mode string) map[string]any {
 				},
 			},
 		},
-		"ttlMs":      60000,
-		"cacheScope": "public",
 	}
 }
 

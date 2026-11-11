@@ -6,16 +6,22 @@ import (
 	"strings"
 )
 
-// The 2026-07-28 specification requires tool schemas to be valid JSON Schema
-// 2020-12 and stricter hosts will reject legacy residue. This file is a
-// targeted, high-signal STRUCTURAL inspector, not a full JSON Schema validator:
-// it flags the specific legacy patterns and loose shapes that break or degrade
-// under 2020-12 validation. Each returned finding names the offending keyword
-// and the fix.
+// The 2026-07-28 specification defines how JSON Schema is used in MCP: a
+// schema without "$schema" is JSON Schema 2020-12, a schema MAY declare another
+// dialect with "$schema", every schema MUST be valid for its declared or
+// default dialect, and implementations are only required to support 2020-12.
+// A tool inputSchema must be a schema object whose root "type" is "object";
+// an outputSchema may be any valid schema.
 //
-// References for the 2020-12 requirement:
-//   - https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/
-//   - https://stacktr.ee/blog/mcp-2026-spec-changes
+// This file is a targeted, high-signal STRUCTURAL inspector, not a full JSON
+// Schema validator: it flags specific pre-2020-12 residue in schemas that are
+// (by default or by declaration) 2020-12, plus malformed shapes. Each returned
+// finding names the offending keyword and the fix.
+//
+// References:
+//   - https://modelcontextprotocol.io/specification/2026-07-28/basic#json-schema-usage
+//   - https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool
+//   - https://json-schema.org/draft/2020-12/schema
 
 // schemaFinding is an internal, un-graded result from the inspector. role is
 // "inputSchema" or "outputSchema"; path locates the keyword within the schema.
@@ -28,58 +34,68 @@ type schemaFinding struct {
 
 // inspectSchema runs the structural checks over one tool schema. rootMustBeObject
 // is true for inputSchema (MCP requires an object root) and false for
-// outputSchema (2026-07-28 leaves output schemas unrestricted).
+// outputSchema (any valid schema is allowed).
 func inspectSchema(schema map[string]any, rootMustBeObject bool) []schemaFinding {
 	var out []schemaFinding
-	// Recursive walk for legacy keywords that may appear at any depth. The root
-	// is passed through so a stray "definitions" can be cross-checked against
-	// $ref targets anywhere in the schema.
-	walkLegacy(schema, schema, "$", &out)
+	if dialect, ok := schema["$schema"].(string); ok && !is2020Dialect(dialect) {
+		// The schema is validated against the dialect it declares, so keywords
+		// that are residue under 2020-12 may be perfectly valid here. Report
+		// the dialect and skip the 2020-12 residue checks.
+		out = append(out, schemaFinding{
+			severity: Info,
+			path:     "$.$schema",
+			message:  fmt.Sprintf("$schema declares a dialect other than 2020-12 (%q); this is allowed, but implementations are only required to support 2020-12, so the 2020-12 keyword checks were skipped", dialect),
+			fix:      "prefer JSON Schema 2020-12 (recommended by the spec; it is the default when $schema is omitted) unless the clients you target document support for this dialect",
+		})
+	} else {
+		// Recursive walk for pre-2020-12 keywords that may appear at any depth.
+		walkLegacy(schema, "$", &out)
+	}
 	// Root-level structural checks.
 	out = append(out, inspectRoot(schema, rootMustBeObject)...)
 	return out
 }
 
-// walkLegacy recursively flags draft-04/06/07 residue anywhere in the schema.
-// root is the whole schema, used to resolve $ref cross-checks.
-func walkLegacy(node, root any, path string, out *[]schemaFinding) {
+// schemaMapKeywords hold a map from an arbitrary name to a subschema, so their
+// keys are names, not schema keywords. dataKeywords hold instance data, not
+// schemas, and are not walked at all.
+var (
+	schemaMapKeywords = map[string]bool{
+		"properties": true, "patternProperties": true, "$defs": true,
+		"definitions": true, "dependentSchemas": true,
+	}
+	dataKeywords = map[string]bool{
+		"enum": true, "const": true, "default": true, "examples": true,
+	}
+)
+
+// walkLegacy recursively flags draft-04/06/07 residue in a schema that is
+// validated as 2020-12. node is a schema (or an array of schemas).
+func walkLegacy(node any, path string, out *[]schemaFinding) {
 	switch v := node.(type) {
 	case map[string]any:
-		// $schema pointing at a pre-2020-12 dialect.
-		if raw, ok := v["$schema"]; ok {
-			if s, ok := raw.(string); ok && isPre2020Dialect(s) {
-				*out = append(*out, schemaFinding{
-					severity: Warn,
-					path:     join(path, "$schema"),
-					message:  fmt.Sprintf("$schema declares a pre-2020-12 dialect (%q)", s),
-					fix:      "set $schema to \"https://json-schema.org/draft/2020-12/schema\" or omit it; MCP 2026-07-28 validates tool schemas as 2020-12",
-				})
+		// draft-04 "id" instead of 2020-12 "$id". The value must be a string:
+		// that is what a schema identifier looks like.
+		if raw, ok := v["id"]; ok {
+			if _, isString := raw.(string); isString {
+				if _, hasDollar := v["$id"]; !hasDollar {
+					*out = append(*out, schemaFinding{
+						severity: Warn,
+						path:     join(path, "id"),
+						message:  "uses draft-04 \"id\"; 2020-12 ignores it, losing the schema identifier",
+						fix:      "rename \"id\" to \"$id\"",
+					})
+				}
 			}
 		}
-		// draft-04 "id" instead of 2020-12 "$id".
-		if _, ok := v["id"]; ok {
-			if _, hasDollar := v["$id"]; !hasDollar {
-				*out = append(*out, schemaFinding{
-					severity: Warn,
-					path:     join(path, "id"),
-					message:  "uses draft-04 \"id\"; 2020-12 ignores it, losing the schema identifier",
-					fix:      "rename \"id\" to \"$id\"",
-				})
-			}
-		}
-		// draft "definitions" instead of 2020-12 "$defs".
+		// "definitions" instead of "$defs". The 2020-12 meta-schema still
+		// defines "definitions", marked deprecated, so this is not a breakage.
 		if _, ok := v["definitions"]; ok {
 			if _, hasDefs := v["$defs"]; !hasDefs {
-				sev := Warn
-				msg := "uses legacy \"definitions\"; 2020-12 treats it as an unknown keyword, not a schema store"
-				if refsInto(root, "#/definitions/") {
-					sev = Fail
-					msg = "uses legacy \"definitions\" and a $ref targets #/definitions/*, which does not resolve under 2020-12"
-				}
 				*out = append(*out, schemaFinding{
-					severity: sev,
+					severity: Warn,
 					path:     join(path, "definitions"),
-					message:  msg,
+					message:  "uses \"definitions\", which 2020-12 keeps only as a deprecated keyword replaced by \"$defs\"",
 					fix:      "rename \"definitions\" to \"$defs\" and update $ref targets to #/$defs/*",
 				})
 			}
@@ -92,18 +108,30 @@ func walkLegacy(node, root any, path string, out *[]schemaFinding) {
 						severity: Fail,
 						path:     join(path, kw),
 						message:  fmt.Sprintf("%s is a boolean (draft-04 form); 2020-12 requires a number", kw),
-						fix:      fmt.Sprintf("replace the boolean %s with a numeric bound, e.g. \"%s\": 0", kw, kw),
+						fix:      fmt.Sprintf("replace the boolean %s with a numeric bound, e.g. \"%s\": 0, or declare the dialect the schema is written in with $schema", kw, kw),
 					})
 				}
 			}
 		}
 		// Recurse into nested schemas in a stable key order.
 		for _, k := range sortedKeys(v) {
-			walkLegacy(v[k], root, join(path, k), out)
+			child := join(path, k)
+			switch {
+			case dataKeywords[k]:
+				// Instance data, not a schema.
+			case schemaMapKeywords[k]:
+				if named, ok := v[k].(map[string]any); ok {
+					for _, name := range sortedKeys(named) {
+						walkLegacy(named[name], join(child, name), out)
+					}
+				}
+			default:
+				walkLegacy(v[k], child, out)
+			}
 		}
 	case []any:
 		for i, item := range v {
-			walkLegacy(item, root, fmt.Sprintf("%s[%d]", path, i), out)
+			walkLegacy(item, fmt.Sprintf("%s[%d]", path, i), out)
 		}
 	}
 }
@@ -115,12 +143,16 @@ func inspectRoot(schema map[string]any, mustBeObject bool) []schemaFinding {
 	typ, hasType := schema["type"]
 
 	if !hasType {
-		out = append(out, schemaFinding{
-			severity: Warn,
-			path:     "$.type",
-			message:  "schema has no top-level \"type\"",
-			fix:      "declare \"type\": \"object\" so 2020-12 validators and stricter hosts accept the schema",
-		})
+		// Only inputSchema has a required root type; an outputSchema may be
+		// any valid schema, so a missing "type" there is not reported.
+		if mustBeObject {
+			out = append(out, schemaFinding{
+				severity: Warn,
+				path:     "$.type",
+				message:  "schema has no top-level \"type\"; MCP requires the root of a tool inputSchema to declare \"type\": \"object\"",
+				fix:      "declare \"type\": \"object\" at the root of the inputSchema",
+			})
+		}
 	} else if mustBeObject && !typeAllowsObject(typ) {
 		out = append(out, schemaFinding{
 			severity: Fail,
@@ -142,26 +174,17 @@ func inspectRoot(schema map[string]any, mustBeObject bool) []schemaFinding {
 			})
 		} else {
 			out = append(out, inspectRequired(schema, pm)...)
-			// Loose-schema heuristic: an object with no properties and no
-			// constraints validates almost anything; stricter hosts may reject.
+			// Loose-schema note: an object with no properties and no
+			// constraints accepts any object. The spec lists this as a valid
+			// form for tools without parameters, so it is INFO only.
 			if mustBeObject && len(pm) == 0 && looseObject(schema) {
-				out = append(out, schemaFinding{
-					severity: Warn,
-					path:     "$",
-					message:  "object schema declares no properties and no constraints (accepts any object)",
-					fix:      "declare the expected \"properties\" (and \"required\"/\"additionalProperties\") so 2020-12 validation is meaningful",
-				})
+				out = append(out, looseFinding())
 			}
 		}
 	} else if mustBeObject && typeAllowsObject(orString(typ, "object")) {
 		// type object but no properties block at all -> also loose.
 		if looseObject(schema) {
-			out = append(out, schemaFinding{
-				severity: Warn,
-				path:     "$",
-				message:  "object schema declares no \"properties\" and no constraints (accepts any object)",
-				fix:      "add a \"properties\" block describing the tool's arguments",
-			})
+			out = append(out, looseFinding())
 		}
 	} else {
 		// required without properties is checked below regardless.
@@ -169,6 +192,15 @@ func inspectRoot(schema map[string]any, mustBeObject bool) []schemaFinding {
 	}
 
 	return out
+}
+
+func looseFinding() schemaFinding {
+	return schemaFinding{
+		severity: Info,
+		path:     "$",
+		message:  "object schema declares no properties and no constraints (accepts any object)",
+		fix:      "this is valid; for a tool with no parameters the spec recommends {\"type\": \"object\", \"additionalProperties\": false}, otherwise declare the expected \"properties\"",
+	}
 }
 
 // inspectRequired validates the "required" keyword shape and cross-checks it
@@ -241,41 +273,9 @@ func looseObject(schema map[string]any) bool {
 	return true
 }
 
-// isPre2020Dialect reports whether a $schema URI names a draft older than
-// 2020-12.
-func isPre2020Dialect(s string) bool {
-	l := strings.ToLower(s)
-	for _, marker := range []string{"draft-04", "draft-06", "draft-07", "draft/2019-09", "draft-03"} {
-		if strings.Contains(l, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// refsInto reports whether any $ref in the schema targets the given fragment
-// prefix (used to decide whether stray "definitions" actually breaks a $ref).
-func refsInto(node any, prefix string) bool {
-	switch v := node.(type) {
-	case map[string]any:
-		if raw, ok := v["$ref"]; ok {
-			if s, ok := raw.(string); ok && strings.Contains(s, prefix) {
-				return true
-			}
-		}
-		for _, val := range v {
-			if refsInto(val, prefix) {
-				return true
-			}
-		}
-	case []any:
-		for _, item := range v {
-			if refsInto(item, prefix) {
-				return true
-			}
-		}
-	}
-	return false
+// is2020Dialect reports whether a $schema URI names JSON Schema 2020-12.
+func is2020Dialect(s string) bool {
+	return strings.Contains(strings.ToLower(s), "draft/2020-12")
 }
 
 // typeAllowsObject reports whether a "type" value permits an object instance.

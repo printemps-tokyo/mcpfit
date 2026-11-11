@@ -3,6 +3,7 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/printemps-tokyo/mcpfit/internal/audit"
@@ -17,7 +18,7 @@ type Options struct {
 
 	Headers         map[string]string
 	Timeout         time.Duration
-	ProtocolVersion string // requested version in initialize; defaults applied by New
+	ProtocolVersion string // version requested in the legacy initialize fallback; defaults applied by New
 }
 
 // Enumeration holds the raw listing results, used for the optional --list
@@ -36,8 +37,15 @@ type Client struct {
 	opts   Options
 	nextID int
 
+	// modern is true once the server has answered server/discover: requests
+	// then carry the 2026-07-28 per-request metadata and no handshake is sent.
+	modern bool
+
 	capabilities map[string]any
-	cacheHints   bool
+	// cacheable counts the results inspected for caching hints; cacheMissing
+	// names the methods whose result lacked one.
+	cacheable    int
+	cacheMissing []string
 }
 
 // New builds a Client for the configured transport. HTTP is selected when URL
@@ -69,11 +77,38 @@ func (c *Client) transportName() string {
 	return "stdio"
 }
 
-// call sends a request and returns its raw result, surfacing JSON-RPC errors.
-func (c *Client) call(method string, params any) (json.RawMessage, error) {
+// request builds the next request. For a modern server it attaches the
+// per-request metadata 2026-07-28 requires (protocol version and client
+// capabilities, plus the recommended client info) under params._meta.
+func (c *Client) request(method string, params map[string]any) Request {
 	id := c.nextID
 	c.nextID++
-	resp, err := c.tr.sendRequest(newRequest(id, method, params))
+	if !c.modern {
+		if len(params) == 0 {
+			return newRequest(id, method, nil)
+		}
+		return newRequest(id, method, params)
+	}
+	p := make(map[string]any, len(params)+1)
+	for k, v := range params {
+		p[k] = v
+	}
+	p["_meta"] = map[string]any{
+		metaProtocolVersion: audit.TargetSpecVersion,
+		metaClientInfo: map[string]any{
+			"name":    clientName,
+			"version": Version(),
+		},
+		metaClientCapabilities: map[string]any{},
+	}
+	req := newRequest(id, method, p)
+	req.protocolVersion = audit.TargetSpecVersion
+	return req
+}
+
+// call sends a request and returns its raw result, surfacing JSON-RPC errors.
+func (c *Client) call(method string, params map[string]any) (json.RawMessage, error) {
+	resp, err := c.tr.sendRequest(c.request(method, params))
 	if err != nil {
 		return nil, err
 	}
@@ -82,10 +117,8 @@ func (c *Client) call(method string, params any) (json.RawMessage, error) {
 
 // callAllowError is like call but returns the RPCError instead of failing, so
 // callers can distinguish "method not found" from a transport error.
-func (c *Client) callAllowError(method string, params any) (json.RawMessage, *RPCError, error) {
-	id := c.nextID
-	c.nextID++
-	resp, err := c.tr.sendRequest(newRequest(id, method, params))
+func (c *Client) callAllowError(method string, params map[string]any) (json.RawMessage, *RPCError, error) {
+	resp, err := c.tr.sendRequest(c.request(method, params))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -95,11 +128,47 @@ func (c *Client) callAllowError(method string, params any) (json.RawMessage, *RP
 	return resp.Result, nil, nil
 }
 
-// initialize runs today's handshake and records negotiated version and caps.
-func (c *Client) initialize() (InitializeResult, error) {
-	if err := c.tr.start(); err != nil {
-		return InitializeResult{}, err
+// discover probes server/discover with the audited revision, as the
+// specification recommends for clients that support both eras. It returns the
+// result when the server is modern, and nil when the server is legacy and the
+// caller must fall back to initialize: any error that is not a recognized
+// modern error, no usable result, or no answer within the timeout.
+func (c *Client) discover() (*DiscoverResult, error) {
+	c.modern = true
+	resp, err := c.tr.sendRequest(c.request(methodDiscover, nil))
+	if err != nil {
+		c.modern = false
+		return nil, nil
 	}
+	if resp.Error != nil {
+		switch resp.Error.Code {
+		case codeUnsupportedProtocolVersion:
+			var data struct {
+				Supported []string `json:"supported"`
+			}
+			_ = json.Unmarshal(resp.Error.Data, &data)
+			return nil, fmt.Errorf("server speaks the per-request-metadata protocol but does not support %s (supported: %s); this build of mcpfit audits %s only",
+				audit.TargetSpecVersion, strings.Join(data.Supported, ", "), audit.TargetSpecVersion)
+		case codeHeaderMismatch, codeMissingClientCapability:
+			return nil, fmt.Errorf("server/discover was rejected: %w", resp.Error)
+		}
+		c.modern = false
+		return nil, nil
+	}
+	var res DiscoverResult
+	if json.Unmarshal(resp.Result, &res) != nil || len(res.SupportedVersions) == 0 {
+		c.modern = false
+		return nil, nil
+	}
+	if len(res.Capabilities) > 0 {
+		_ = json.Unmarshal(res.Capabilities, &c.capabilities)
+	}
+	c.noteCacheHints(methodDiscover, res.TTLMs, res.CacheScope)
+	return &res, nil
+}
+
+// initialize runs the legacy handshake and records negotiated version and caps.
+func (c *Client) initialize() (InitializeResult, error) {
 	params := map[string]any{
 		"protocolVersion": c.opts.ProtocolVersion,
 		"capabilities":    map[string]any{},
@@ -140,7 +209,7 @@ func (c *Client) listTools() ([]Tool, error) {
 		if err := json.Unmarshal(raw, &lr); err != nil {
 			return nil, fmt.Errorf("tools/list returned malformed result: %w", err)
 		}
-		c.noteCacheHints(lr)
+		c.noteCacheHints(methodToolsList, lr.TTLMs, lr.CacheScope)
 		all = append(all, lr.Tools...)
 		if lr.NextCursor == "" {
 			return all, nil
@@ -164,7 +233,7 @@ func (c *Client) listResources() ([]Resource, error) {
 		if err := json.Unmarshal(raw, &lr); err != nil {
 			return nil, fmt.Errorf("resources/list returned malformed result: %w", err)
 		}
-		c.noteCacheHints(lr)
+		c.noteCacheHints(methodResourcesList, lr.TTLMs, lr.CacheScope)
 		all = append(all, lr.Resources...)
 		if lr.NextCursor == "" {
 			return all, nil
@@ -188,7 +257,7 @@ func (c *Client) listPrompts() ([]Prompt, error) {
 		if err := json.Unmarshal(raw, &lr); err != nil {
 			return nil, fmt.Errorf("prompts/list returned malformed result: %w", err)
 		}
-		c.noteCacheHints(lr)
+		c.noteCacheHints(methodPromptsList, lr.TTLMs, lr.CacheScope)
 		all = append(all, lr.Prompts...)
 		if lr.NextCursor == "" {
 			return all, nil
@@ -197,13 +266,22 @@ func (c *Client) listPrompts() ([]Prompt, error) {
 	}
 }
 
-func (c *Client) noteCacheHints(lr listResult) {
-	if lr.TTLMs != nil || lr.CacheScope != "" {
-		c.cacheHints = true
+// noteCacheHints records one result that 2026-07-28 requires to carry both
+// caching hints, and remembers the method when either is absent.
+func (c *Client) noteCacheHints(method string, ttlMs *float64, cacheScope string) {
+	c.cacheable++
+	if ttlMs != nil && cacheScope != "" {
+		return
 	}
+	for _, m := range c.cacheMissing {
+		if m == method {
+			return
+		}
+	}
+	c.cacheMissing = append(c.cacheMissing, method)
 }
 
-func cursorParams(cursor string) any {
+func cursorParams(cursor string) map[string]any {
 	if cursor == "" {
 		return nil
 	}
@@ -213,13 +291,43 @@ func cursorParams(cursor string) any {
 // Close shuts down the transport.
 func (c *Client) Close() error { return c.tr.close() }
 
-// Probe runs the full flow (initialize, enumerate, capability probes) and
-// returns both the raw enumeration (for --list) and the compact audit
-// Observation. The transport is not closed here; the caller owns its lifecycle.
+// Probe runs the full flow (server/discover, or the initialize fallback for a
+// legacy server; enumeration; capability probes) and returns both the raw
+// enumeration (for --list) and the compact audit Observation. The transport is
+// not closed here; the caller owns its lifecycle.
 func (c *Client) Probe() (Enumeration, audit.Observation, error) {
-	init, err := c.initialize()
+	if err := c.tr.start(); err != nil {
+		return Enumeration{}, audit.Observation{}, err
+	}
+
+	var (
+		era        string
+		supported  []string
+		version    string
+		requested  string
+		serverInfo Implementation
+	)
+	disc, err := c.discover()
 	if err != nil {
 		return Enumeration{}, audit.Observation{}, err
+	}
+	if disc != nil {
+		era = audit.EraModern
+		supported = disc.SupportedVersions
+		requested = audit.TargetSpecVersion
+		version = inUseVersion(supported)
+		if raw, ok := disc.Meta[metaServerInfo]; ok {
+			_ = json.Unmarshal(raw, &serverInfo)
+		}
+	} else {
+		init, err := c.initialize()
+		if err != nil {
+			return Enumeration{}, audit.Observation{}, err
+		}
+		era = audit.EraLegacy
+		requested = c.opts.ProtocolVersion
+		version = init.ProtocolVersion
+		serverInfo = init.ServerInfo
 	}
 
 	tools, err := c.listTools()
@@ -236,13 +344,13 @@ func (c *Client) Probe() (Enumeration, audit.Observation, error) {
 	}
 
 	tasksCap := c.hasTasksCapability()
-	blocking := c.probeBlockingTaskMethods(tasksCap)
+	removed := c.probeRemovedTaskMethods(tasksCap)
 
 	sig := c.tr.signals()
 
 	enum := Enumeration{
-		ServerInfo:      init.ServerInfo,
-		ProtocolVersion: init.ProtocolVersion,
+		ServerInfo:      serverInfo,
+		ProtocolVersion: version,
 		Tools:           tools,
 		Resources:       resources,
 		Prompts:         prompts,
@@ -251,10 +359,12 @@ func (c *Client) Probe() (Enumeration, audit.Observation, error) {
 	obs := audit.Observation{
 		Target:                  c.targetLabel(),
 		Transport:               c.transportName(),
-		RequestedVersion:        c.opts.ProtocolVersion,
-		ProtocolVersion:         init.ProtocolVersion,
-		ServerName:              init.ServerInfo.Name,
-		ServerVersion:           init.ServerInfo.Version,
+		Era:                     era,
+		SupportedVersions:       supported,
+		RequestedVersion:        requested,
+		ProtocolVersion:         version,
+		ServerName:              serverInfo.Name,
+		ServerVersion:           serverInfo.Version,
 		Capabilities:            c.capabilities,
 		Tools:                   toAuditTools(tools),
 		ResourceCount:           len(resources),
@@ -262,13 +372,30 @@ func (c *Client) Probe() (Enumeration, audit.Observation, error) {
 		SessionIDIssued:         sig.SessionIDIssued,
 		SessionIDValue:          sig.SessionIDValue,
 		TasksCapability:         tasksCap,
-		TaskMethodsBlocking:     blocking,
-		CacheHints:              c.cacheHints,
+		TaskMethodsRemoved:      removed,
+		CacheableResults:        c.cacheable,
+		CacheHintsMissing:       c.cacheMissing,
 		AuthCredentialsProvided: sig.AuthCredentialsProvided,
 		AuthChallenged:          sig.AuthChallenged,
 		AuthChallenge:           sig.AuthChallenge,
 	}
 	return enum, obs, nil
+}
+
+// inUseVersion picks the version to report for a modern server: the audited
+// revision when the server lists it (that is what mcpfit sends), otherwise the
+// newest listed one. MCP versions are dates, so string order is date order.
+func inUseVersion(supported []string) string {
+	newest := ""
+	for _, v := range supported {
+		if v == audit.TargetSpecVersion {
+			return v
+		}
+		if v > newest {
+			newest = v
+		}
+	}
+	return newest
 }
 
 func (c *Client) targetLabel() string {
@@ -306,18 +433,19 @@ func (c *Client) hasTasksCapability() bool {
 	return false
 }
 
-// probeBlockingTaskMethods checks (observably) whether the removed blocking
-// method tasks/list still responds. It only runs when a tasks capability is
-// declared, and treats a "method not found" error as good (removed).
-func (c *Client) probeBlockingTaskMethods(tasksCap bool) []string {
+// probeRemovedTaskMethods checks (observably) whether tasks/list, which the
+// 2026-07-28 Tasks extension removed, still responds. It only runs when a
+// tasks capability is declared, and treats any error as good (removed). The
+// blocking tasks/result is not probed: it needs a real task id.
+func (c *Client) probeRemovedTaskMethods(tasksCap bool) []string {
 	if !tasksCap {
 		return nil
 	}
-	var blocking []string
+	var removed []string
 	if _, rpcErr, err := c.callAllowError("tasks/list", nil); err == nil && rpcErr == nil {
-		blocking = append(blocking, "tasks/list")
+		removed = append(removed, "tasks/list")
 	}
-	return blocking
+	return removed
 }
 
 func containsTasks(s string) bool {
